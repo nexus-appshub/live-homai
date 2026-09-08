@@ -1,7 +1,6 @@
 import os
 import ssl
 import time
-import json
 import threading
 import subprocess
 import urllib.request
@@ -32,24 +31,23 @@ os.makedirs(HLS_DIR, exist_ok=True)
 STREAM_STATUS = {"state": "Initializing", "current_video": None, "last_error": None}
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 
-# SSL সার্টিফিকেট এরর এড়াতে কনটেক্সট
 SSL_CTX = ssl.create_default_context()
 SSL_CTX.check_hostname = False
 SSL_CTX.verify_mode = ssl.CERT_NONE
 
-# দ্রুতগতির Piped ও Invidious স্ট্রিমিং API তালিকা
-RESOLVER_ENDPOINTS = [
-    {"type": "piped", "url": "https://api.piped.private.coffee/streams/{id}"},
-    {"type": "piped", "url": "https://pipedapi.kavin.rocks/streams/{id}"},
-    {"type": "piped", "url": "https://piped-api.garudalinux.org/streams/{id}"},
-    {"type": "piped", "url": "https://pipedapi.leptons.xyz/streams/{id}"},
-    {"type": "invidious", "url": "https://inv.nadeko.net/api/v1/videos/{id}"},
-    {"type": "invidious", "url": "https://invidious.nerdvpn.de/api/v1/videos/{id}"},
-    {"type": "invidious", "url": "https://yewtu.be/api/v1/videos/{id}"}
+# বর্তমানে সচল ও নির্ভরযোগ্য প্রক্সি নোড তালিকা
+LIVE_PROXY_INSTANCES = [
+    "https://iv.melmac.space",
+    "https://invidious.drgns.space",
+    "https://invidious.flokinet.to",
+    "https://invidious.projectsegfau.lt",
+    "https://invidious.privacydev.net",
+    "https://yt.artemislena.eu",
+    "https://inv.tux.pizza"
 ]
 
 def keep_alive_ping():
-    """Render ফ্রি টায়ার স্লিপ রোধে সেলফ-পিং"""
+    """Render ফ্রি টায়ার স্লিপ মোড প্রতিরোধ"""
     app_url = os.environ.get("RENDER_EXTERNAL_URL", "https://live-homai.onrender.com")
     time.sleep(30)
     while True:
@@ -67,42 +65,26 @@ def get_channel_video_ids():
         info = ydl.extract_info(CHANNEL_URL, download=False)
         return [entry['id'] for entry in info.get('entries', []) if entry and 'id' in entry]
 
-def get_stream_url(video_id):
-    """Piped এবং Invidious API দিয়ে বট-ব্লক ছাড়া সরাসরি স্ট্রিম লিংক আনা"""
-    for endpoint in RESOLVER_ENDPOINTS:
-        api_url = endpoint["url"].format(id=video_id)
-        try:
-            req = urllib.request.Request(api_url, headers={'User-Agent': USER_AGENT})
-            with urllib.request.urlopen(req, timeout=6, context=SSL_CTX) as response:
-                data = json.loads(response.read().decode('utf-8'))
-                
-                # ১. Piped API ফরম্যাট পার্সিং (ভিডিও + অডিও মার্জড)
-                if endpoint["type"] == "piped":
-                    streams = data.get("videoStreams", [])
-                    # অডিও সহ পূর্ণ MP4 খোঁজা
-                    for s in streams:
-                        if not s.get("videoOnly", True) and s.get("url"):
-                            return s["url"]
-                    # বিকল্প: প্রথম ভিডিও স্ট্রিম
-                    if streams and streams[0].get("url"):
-                        return streams[0]["url"]
-
-                # ২. Invidious API ফরম্যাট পার্সিং
-                elif endpoint["type"] == "invidious":
-                    formats = data.get("formatStreams", [])
-                    if formats and formats[-1].get("url"):
-                        return formats[-1]["url"]
-                    for fmt in data.get("adaptiveFormats", []):
-                        if fmt.get("type", "").startswith("video") and fmt.get("url"):
-                            return fmt["url"]
-
-        except Exception:
-            continue
-            
+def get_working_stream_url(video_id):
+    """সচল প্রক্সি থেকে ভিডিও স্ট্রিম যাচাই করে নিশ্চিত লিংক বের করা"""
+    # itag 22 (720p) অথবা itag 18 (360p)
+    for itag in [22, 18]:
+        for base in LIVE_PROXY_INSTANCES:
+            # local=true ইউটিউব ডেটাসেন্টার IP ব্লক সম্পূর্ণরূপে বাইপাস করে
+            test_url = f"{base}/latest_version?id={video_id}&itag={itag}&local=true"
+            try:
+                req = urllib.request.Request(
+                    test_url,
+                    headers={'User-Agent': USER_AGENT, 'Range': 'bytes=0-2048'}
+                )
+                with urllib.request.urlopen(req, timeout=4, context=SSL_CTX) as resp:
+                    if resp.status in (200, 206):
+                        return test_url
+            except Exception:
+                continue
     return None
 
 def start_continuous_stream():
-    """লাইভ ব্রডকাস্ট লুপ"""
     global STREAM_STATUS
     m3u8_path = os.path.join(HLS_DIR, 'live.m3u8')
     
@@ -112,28 +94,32 @@ def start_continuous_stream():
             video_ids = get_channel_video_ids()
             
             if not video_ids:
-                STREAM_STATUS["last_error"] = "No videos found. Retrying in 15s..."
+                STREAM_STATUS["last_error"] = "No videos found. Retrying in 15 seconds..."
                 time.sleep(15)
                 continue
 
             for vid in video_ids:
                 try:
                     STREAM_STATUS["current_video"] = vid
-                    STREAM_STATUS["state"] = f"Resolving stream URL for {vid}"
-                    stream_url = get_stream_url(vid)
+                    STREAM_STATUS["state"] = f"Connecting stream for {vid}"
+                    stream_url = get_working_stream_url(vid)
                     
                     if not stream_url:
-                        STREAM_STATUS["last_error"] = f"Resolvers failed for {vid}, skipping..."
+                        STREAM_STATUS["last_error"] = f"No proxy nodes available for {vid}, trying next..."
                         time.sleep(2)
                         continue
 
                     STREAM_STATUS["state"] = f"Streaming {vid}"
                     STREAM_STATUS["last_error"] = None
 
-                    # FFmpeg রেম্যাক্সিং (CPU ও RAM ব্যবহার সর্বনিম্ন থাকবে)
+                    # FFmpeg HLS জেনারেটর (অটো-রিকানেক্ট ও লো-রিসোর্স কনফিগ)
                     cmd = [
                         'ffmpeg',
                         '-user_agent', USER_AGENT,
+                        '-reconnect', '1',
+                        '-reconnect_at_eof', '1',
+                        '-reconnect_streamed', '1',
+                        '-reconnect_delay_max', '5',
                         '-re',
                         '-i', stream_url,
                         '-c:v', 'copy',
