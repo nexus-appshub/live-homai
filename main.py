@@ -1,4 +1,5 @@
 import os
+import ssl
 import time
 import json
 import threading
@@ -31,67 +32,77 @@ os.makedirs(HLS_DIR, exist_ok=True)
 STREAM_STATUS = {"state": "Initializing", "current_video": None, "last_error": None}
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 
-# পাবলিক Invidious প্রক্সি সার্ভার লিস্ট (বট ব্লকিং বাইপাস করার জন্য)
-INVIDIOUS_INSTANCES = [
-    "https://inv.nadeko.net",
-    "https://invidious.nerdvpn.de",
-    "https://yewtu.be",
-    "https://invidious.private.coffee",
-    "https://vid.puffyan.us"
+# SSL সার্টিফিকেট এরর এড়াতে কনটেক্সট
+SSL_CTX = ssl.create_default_context()
+SSL_CTX.check_hostname = False
+SSL_CTX.verify_mode = ssl.CERT_NONE
+
+# দ্রুতগতির Piped ও Invidious স্ট্রিমিং API তালিকা
+RESOLVER_ENDPOINTS = [
+    {"type": "piped", "url": "https://api.piped.private.coffee/streams/{id}"},
+    {"type": "piped", "url": "https://pipedapi.kavin.rocks/streams/{id}"},
+    {"type": "piped", "url": "https://piped-api.garudalinux.org/streams/{id}"},
+    {"type": "piped", "url": "https://pipedapi.leptons.xyz/streams/{id}"},
+    {"type": "invidious", "url": "https://inv.nadeko.net/api/v1/videos/{id}"},
+    {"type": "invidious", "url": "https://invidious.nerdvpn.de/api/v1/videos/{id}"},
+    {"type": "invidious", "url": "https://yewtu.be/api/v1/videos/{id}"}
 ]
 
-# ১. সার্ভার ঘুমিয়ে পড়া রোধ করতে সেলফ-পিং
 def keep_alive_ping():
+    """Render ফ্রি টায়ার স্লিপ রোধে সেলফ-পিং"""
     app_url = os.environ.get("RENDER_EXTERNAL_URL", "https://live-homai.onrender.com")
     time.sleep(30)
     while True:
         try:
             req = urllib.request.Request(app_url, headers={'User-Agent': 'KeepAlive/1.0'})
-            urllib.request.urlopen(req, timeout=10)
+            urllib.request.urlopen(req, timeout=10, context=SSL_CTX)
         except Exception:
             pass
         time.sleep(600)
 
-# ২. চ্যানেল থেকে ভিডিও লিস্ট সংগ্রহ (ফ্ল্যাট এক্সট্রাকশন ব্লক হয় না)
 def get_channel_video_ids():
+    """চ্যানেলের সব ভিডিওর আইডি সংগ্রহ"""
     opts = {'quiet': True, 'extract_flat': True}
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(CHANNEL_URL, download=False)
         return [entry['id'] for entry in info.get('entries', []) if entry and 'id' in entry]
 
-# ৩. Invidious API দিয়ে বট-ব্লক ছাড়া সরাসরি স্ট্রিম লিংক আনা
 def get_stream_url(video_id):
-    for instance in INVIDIOUS_INSTANCES:
+    """Piped এবং Invidious API দিয়ে বট-ব্লক ছাড়া সরাসরি স্ট্রিম লিংক আনা"""
+    for endpoint in RESOLVER_ENDPOINTS:
+        api_url = endpoint["url"].format(id=video_id)
         try:
-            api_url = f"{instance}/api/v1/videos/{video_id}"
             req = urllib.request.Request(api_url, headers={'User-Agent': USER_AGENT})
-            with urllib.request.urlopen(req, timeout=7) as response:
+            with urllib.request.urlopen(req, timeout=6, context=SSL_CTX) as response:
                 data = json.loads(response.read().decode('utf-8'))
                 
-                # অডিও ও ভিডিও মার্জ করা আছে এমন MP4 স্ট্রিম খোঁজা
-                formats = data.get("formatStreams", [])
-                if formats:
-                    return formats[-1].get("url")
-                
-                # বিকল্প ফরম্যাট
-                for fmt in data.get("adaptiveFormats", []):
-                    if fmt.get("type", "").startswith("video") and "url" in fmt:
-                        return fmt["url"]
+                # ১. Piped API ফরম্যাট পার্সিং (ভিডিও + অডিও মার্জড)
+                if endpoint["type"] == "piped":
+                    streams = data.get("videoStreams", [])
+                    # অডিও সহ পূর্ণ MP4 খোঁজা
+                    for s in streams:
+                        if not s.get("videoOnly", True) and s.get("url"):
+                            return s["url"]
+                    # বিকল্প: প্রথম ভিডিও স্ট্রিম
+                    if streams and streams[0].get("url"):
+                        return streams[0]["url"]
+
+                # ২. Invidious API ফরম্যাট পার্সিং
+                elif endpoint["type"] == "invidious":
+                    formats = data.get("formatStreams", [])
+                    if formats and formats[-1].get("url"):
+                        return formats[-1]["url"]
+                    for fmt in data.get("adaptiveFormats", []):
+                        if fmt.get("type", "").startswith("video") and fmt.get("url"):
+                            return fmt["url"]
+
         except Exception:
             continue
             
-    # ব্যাকআপ হিসেবে yt-dlp ট্রাই করবে
-    try:
-        opts = {'quiet': True, 'format': 'best'}
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
-            return info.get('url')
-    except Exception as e:
-        STREAM_STATUS["last_error"] = str(e)
-        return None
+    return None
 
-# ৪. একটানা লাইভ HLS ব্রডকাস্ট লুপ
 def start_continuous_stream():
+    """লাইভ ব্রডকাস্ট লুপ"""
     global STREAM_STATUS
     m3u8_path = os.path.join(HLS_DIR, 'live.m3u8')
     
@@ -101,7 +112,7 @@ def start_continuous_stream():
             video_ids = get_channel_video_ids()
             
             if not video_ids:
-                STREAM_STATUS["last_error"] = "No videos found. Retrying in 15 seconds..."
+                STREAM_STATUS["last_error"] = "No videos found. Retrying in 15s..."
                 time.sleep(15)
                 continue
 
@@ -112,12 +123,14 @@ def start_continuous_stream():
                     stream_url = get_stream_url(vid)
                     
                     if not stream_url:
+                        STREAM_STATUS["last_error"] = f"Resolvers failed for {vid}, skipping..."
+                        time.sleep(2)
                         continue
 
                     STREAM_STATUS["state"] = f"Streaming {vid}"
                     STREAM_STATUS["last_error"] = None
 
-                    # FFmpeg রেম্যাক্সিং (ল্যাগ ছাড়া দ্রুত লাইভ স্ট্রিম তৈরি)
+                    # FFmpeg রেম্যাক্সিং (CPU ও RAM ব্যবহার সর্বনিম্ন থাকবে)
                     cmd = [
                         'ffmpeg',
                         '-user_agent', USER_AGENT,
@@ -144,7 +157,6 @@ def start_continuous_stream():
             STREAM_STATUS["last_error"] = str(e)
             time.sleep(10)
 
-# থ্রেড চালু
 threading.Thread(target=keep_alive_ping, daemon=True).start()
 threading.Thread(target=start_continuous_stream, daemon=True).start()
 
