@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import threading
 import subprocess
 import urllib.request
@@ -28,9 +29,18 @@ HLS_DIR = os.path.join(BASE_DIR, "hls")
 os.makedirs(HLS_DIR, exist_ok=True)
 
 STREAM_STATUS = {"state": "Initializing", "current_video": None, "last_error": None}
-USER_AGENT = "Mozilla/5.0 (Android 12; Mobile; VR) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 
-# ১. স্লিপ রোধে সেলফ-পিং
+# পাবলিক Invidious প্রক্সি সার্ভার লিস্ট (বট ব্লকিং বাইপাস করার জন্য)
+INVIDIOUS_INSTANCES = [
+    "https://inv.nadeko.net",
+    "https://invidious.nerdvpn.de",
+    "https://yewtu.be",
+    "https://invidious.private.coffee",
+    "https://vid.puffyan.us"
+]
+
+# ১. সার্ভার ঘুমিয়ে পড়া রোধ করতে সেলফ-পিং
 def keep_alive_ping():
     app_url = os.environ.get("RENDER_EXTERNAL_URL", "https://live-homai.onrender.com")
     time.sleep(30)
@@ -42,43 +52,45 @@ def keep_alive_ping():
             pass
         time.sleep(600)
 
-# ২. চ্যানেল থেকে ভিডিও লিস্ট আনা
+# ২. চ্যানেল থেকে ভিডিও লিস্ট সংগ্রহ (ফ্ল্যাট এক্সট্রাকশন ব্লক হয় না)
 def get_channel_video_ids():
-    opts = {
-        'quiet': True,
-        'extract_flat': True,
-        'extractor_args': {'youtube': {'player_client': ['android_vr']}}
-    }
+    opts = {'quiet': True, 'extract_flat': True}
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(CHANNEL_URL, download=False)
         return [entry['id'] for entry in info.get('entries', []) if entry and 'id' in entry]
 
-# ৩. android_vr ক্লায়েন্ট দিয়ে অডিও ও ভিডিও স্ট্রিম লিংক সংগ্রহ
-def get_video_streams(video_id):
-    opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'format': 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best',
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['android_vr']
-            }
-        }
-    }
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
-        
-        # অডিও ও ভিডিও আলাদা থাকলে দুটো লিংকই নেবে
-        if 'requested_formats' in info and len(info['requested_formats']) >= 2:
-            return {
-                'video': info['requested_formats'][0]['url'],
-                'audio': info['requested_formats'][1]['url']
-            }
-        elif 'url' in info:
-            return {'video': info['url'], 'audio': None}
+# ৩. Invidious API দিয়ে বট-ব্লক ছাড়া সরাসরি স্ট্রিম লিংক আনা
+def get_stream_url(video_id):
+    for instance in INVIDIOUS_INSTANCES:
+        try:
+            api_url = f"{instance}/api/v1/videos/{video_id}"
+            req = urllib.request.Request(api_url, headers={'User-Agent': USER_AGENT})
+            with urllib.request.urlopen(req, timeout=7) as response:
+                data = json.loads(response.read().decode('utf-8'))
+                
+                # অডিও ও ভিডিও মার্জ করা আছে এমন MP4 স্ট্রিম খোঁজা
+                formats = data.get("formatStreams", [])
+                if formats:
+                    return formats[-1].get("url")
+                
+                # বিকল্প ফরম্যাট
+                for fmt in data.get("adaptiveFormats", []):
+                    if fmt.get("type", "").startswith("video") and "url" in fmt:
+                        return fmt["url"]
+        except Exception:
+            continue
+            
+    # ব্যাকআপ হিসেবে yt-dlp ট্রাই করবে
+    try:
+        opts = {'quiet': True, 'format': 'best'}
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+            return info.get('url')
+    except Exception as e:
+        STREAM_STATUS["last_error"] = str(e)
         return None
 
-# ৪. অবিচ্ছিন্ন লাইভ HLS ব্রডকাস্ট লুপ
+# ৪. একটানা লাইভ HLS ব্রডকাস্ট লুপ
 def start_continuous_stream():
     global STREAM_STATUS
     m3u8_path = os.path.join(HLS_DIR, 'live.m3u8')
@@ -87,58 +99,40 @@ def start_continuous_stream():
         try:
             STREAM_STATUS["state"] = "Fetching videos"
             video_ids = get_channel_video_ids()
+            
             if not video_ids:
+                STREAM_STATUS["last_error"] = "No videos found. Retrying in 15 seconds..."
                 time.sleep(15)
                 continue
 
             for vid in video_ids:
                 try:
                     STREAM_STATUS["current_video"] = vid
-                    STREAM_STATUS["state"] = f"Extracting {vid} via android_vr"
-                    streams = get_video_streams(vid)
+                    STREAM_STATUS["state"] = f"Resolving stream URL for {vid}"
+                    stream_url = get_stream_url(vid)
                     
-                    if not streams or not streams.get('video'):
+                    if not stream_url:
                         continue
 
                     STREAM_STATUS["state"] = f"Streaming {vid}"
                     STREAM_STATUS["last_error"] = None
 
-                    # অডিও ও ভিডিও মার্জ করে লাইভ HLS তৈরি
-                    if streams.get('audio'):
-                        cmd = [
-                            'ffmpeg',
-                            '-user_agent', USER_AGENT,
-                            '-re',
-                            '-i', streams['video'],
-                            '-i', streams['audio'],
-                            '-map', '0:v:0',
-                            '-map', '1:a:0',
-                            '-c:v', 'copy',
-                            '-c:a', 'aac',
-                            '-b:a', '128k',
-                            '-f', 'hls',
-                            '-hls_time', '4',
-                            '-hls_list_size', '6',
-                            '-hls_flags', 'delete_segments+append_list',
-                            m3u8_path
-                        ]
-                    else:
-                        cmd = [
-                            'ffmpeg',
-                            '-user_agent', USER_AGENT,
-                            '-re',
-                            '-i', streams['video'],
-                            '-c:v', 'copy',
-                            '-c:a', 'aac',
-                            '-b:a', '128k',
-                            '-f', 'hls',
-                            '-hls_time', '4',
-                            '-hls_list_size', '6',
-                            '-hls_flags', 'delete_segments+append_list',
-                            m3u8_path
-                        ]
+                    # FFmpeg রেম্যাক্সিং (ল্যাগ ছাড়া দ্রুত লাইভ স্ট্রিম তৈরি)
+                    cmd = [
+                        'ffmpeg',
+                        '-user_agent', USER_AGENT,
+                        '-re',
+                        '-i', stream_url,
+                        '-c:v', 'copy',
+                        '-c:a', 'aac',
+                        '-b:a', '128k',
+                        '-f', 'hls',
+                        '-hls_time', '4',
+                        '-hls_list_size', '6',
+                        '-hls_flags', 'delete_segments+append_list',
+                        m3u8_path
+                    ]
                     
-                    # RAM ওভারফ্লো রোধ করতে DEVNULL ব্যবহার
                     process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     process.wait()
 
@@ -150,6 +144,7 @@ def start_continuous_stream():
             STREAM_STATUS["last_error"] = str(e)
             time.sleep(10)
 
+# থ্রেড চালু
 threading.Thread(target=keep_alive_ping, daemon=True).start()
 threading.Thread(target=start_continuous_stream, daemon=True).start()
 
@@ -157,7 +152,7 @@ threading.Thread(target=start_continuous_stream, daemon=True).start()
 def serve_hls(filename: str):
     file_path = os.path.join(HLS_DIR, filename)
     if not os.path.exists(file_path):
-        raise HTTPException(status_code=503, detail="Stream is preparing, please wait...")
+        raise HTTPException(status_code=503, detail="Stream is preparing, please wait a moment...")
     return FileResponse(file_path)
 
 @app.get("/")
