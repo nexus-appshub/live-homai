@@ -28,31 +28,9 @@ HLS_DIR = os.path.join(BASE_DIR, "hls")
 os.makedirs(HLS_DIR, exist_ok=True)
 
 STREAM_STATUS = {"state": "Initializing", "current_video": None, "last_error": None}
-USER_AGENT = "Mozilla/5.0 (SMART-TV; Linux; Tizen 5.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/5.0 TV Safari/538.1"
+USER_AGENT = "Mozilla/5.0 (Android 12; Mobile; VR) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-# কুকি ফাইল পাথ চেক
-COOKIE_FILE = None
-for path in ["cookies.txt", os.path.join(BASE_DIR, "cookies.txt"), "/etc/secrets/cookies.txt"]:
-    if os.path.exists(path):
-        COOKIE_FILE = path
-        break
-
-def get_ydl_options():
-    """Smart TV ক্লায়েন্ট কনফিগারেশন যা ক্লাউড সার্ভারের বট ব্লক বাইপাস করে"""
-    opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'format': 'best',
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['tv_embedded', 'tv']
-            }
-        }
-    }
-    if COOKIE_FILE:
-        opts['cookiefile'] = COOKIE_FILE
-    return opts
-
+# ১. স্লিপ রোধে সেলফ-পিং
 def keep_alive_ping():
     app_url = os.environ.get("RENDER_EXTERNAL_URL", "https://live-homai.onrender.com")
     time.sleep(30)
@@ -64,19 +42,43 @@ def keep_alive_ping():
             pass
         time.sleep(600)
 
+# ২. চ্যানেল থেকে ভিডিও লিস্ট আনা
 def get_channel_video_ids():
-    opts = get_ydl_options()
-    opts['extract_flat'] = True
+    opts = {
+        'quiet': True,
+        'extract_flat': True,
+        'extractor_args': {'youtube': {'player_client': ['android_vr']}}
+    }
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(CHANNEL_URL, download=False)
         return [entry['id'] for entry in info.get('entries', []) if entry and 'id' in entry]
 
-def get_single_stream_url(video_id):
-    opts = get_ydl_options()
+# ৩. android_vr ক্লায়েন্ট দিয়ে অডিও ও ভিডিও স্ট্রিম লিংক সংগ্রহ
+def get_video_streams(video_id):
+    opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'format': 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best',
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android_vr']
+            }
+        }
+    }
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
-        return info.get('url')
+        
+        # অডিও ও ভিডিও আলাদা থাকলে দুটো লিংকই নেবে
+        if 'requested_formats' in info and len(info['requested_formats']) >= 2:
+            return {
+                'video': info['requested_formats'][0]['url'],
+                'audio': info['requested_formats'][1]['url']
+            }
+        elif 'url' in info:
+            return {'video': info['url'], 'audio': None}
+        return None
 
+# ৪. অবিচ্ছিন্ন লাইভ HLS ব্রডকাস্ট লুপ
 def start_continuous_stream():
     global STREAM_STATUS
     m3u8_path = os.path.join(HLS_DIR, 'live.m3u8')
@@ -86,42 +88,59 @@ def start_continuous_stream():
             STREAM_STATUS["state"] = "Fetching videos"
             video_ids = get_channel_video_ids()
             if not video_ids:
-                STREAM_STATUS["last_error"] = "No videos returned. Retrying in 15 seconds..."
                 time.sleep(15)
                 continue
 
             for vid in video_ids:
                 try:
                     STREAM_STATUS["current_video"] = vid
-                    STREAM_STATUS["state"] = f"Extracting stream URL for {vid}"
-                    stream_url = get_single_stream_url(vid)
+                    STREAM_STATUS["state"] = f"Extracting {vid} via android_vr"
+                    streams = get_video_streams(vid)
                     
-                    if not stream_url:
+                    if not streams or not streams.get('video'):
                         continue
 
                     STREAM_STATUS["state"] = f"Streaming {vid}"
                     STREAM_STATUS["last_error"] = None
 
-                    cmd = [
-                        'ffmpeg',
-                        '-user_agent', USER_AGENT,
-                        '-re',
-                        '-i', stream_url,
-                        '-c:v', 'copy',
-                        '-c:a', 'aac',
-                        '-b:a', '128k',
-                        '-f', 'hls',
-                        '-hls_time', '4',
-                        '-hls_list_size', '6',
-                        '-hls_flags', 'delete_segments+append_list',
-                        m3u8_path
-                    ]
+                    # অডিও ও ভিডিও মার্জ করে লাইভ HLS তৈরি
+                    if streams.get('audio'):
+                        cmd = [
+                            'ffmpeg',
+                            '-user_agent', USER_AGENT,
+                            '-re',
+                            '-i', streams['video'],
+                            '-i', streams['audio'],
+                            '-map', '0:v:0',
+                            '-map', '1:a:0',
+                            '-c:v', 'copy',
+                            '-c:a', 'aac',
+                            '-b:a', '128k',
+                            '-f', 'hls',
+                            '-hls_time', '4',
+                            '-hls_list_size', '6',
+                            '-hls_flags', 'delete_segments+append_list',
+                            m3u8_path
+                        ]
+                    else:
+                        cmd = [
+                            'ffmpeg',
+                            '-user_agent', USER_AGENT,
+                            '-re',
+                            '-i', streams['video'],
+                            '-c:v', 'copy',
+                            '-c:a', 'aac',
+                            '-b:a', '128k',
+                            '-f', 'hls',
+                            '-hls_time', '4',
+                            '-hls_list_size', '6',
+                            '-hls_flags', 'delete_segments+append_list',
+                            m3u8_path
+                        ]
                     
-                    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                    _, stderr = process.communicate()
-                    
-                    if process.returncode != 0:
-                        STREAM_STATUS["last_error"] = stderr.decode('utf-8', errors='ignore')[-300:]
+                    # RAM ওভারফ্লো রোধ করতে DEVNULL ব্যবহার
+                    process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    process.wait()
 
                 except Exception as err:
                     STREAM_STATUS["last_error"] = str(err)
@@ -138,14 +157,13 @@ threading.Thread(target=start_continuous_stream, daemon=True).start()
 def serve_hls(filename: str):
     file_path = os.path.join(HLS_DIR, filename)
     if not os.path.exists(file_path):
-        raise HTTPException(status_code=503, detail="Stream is preparing, please wait a moment...")
+        raise HTTPException(status_code=503, detail="Stream is preparing, please wait...")
     return FileResponse(file_path)
 
 @app.get("/")
 def index():
     return {
         "server": "online",
-        "cookie_loaded": COOKIE_FILE is not None,
         "stream_info": STREAM_STATUS,
         "stream_url": "/hls/live.m3u8"
     }
