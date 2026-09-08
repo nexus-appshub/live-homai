@@ -28,25 +28,24 @@ HLS_DIR = os.path.join(BASE_DIR, "hls")
 os.makedirs(HLS_DIR, exist_ok=True)
 
 STREAM_STATUS = {"state": "Initializing", "current_video": None, "last_error": None}
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+USER_AGENT = "Mozilla/5.0 (SMART-TV; Linux; Tizen 5.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/5.0 TV Safari/538.1"
 
-# কুকি ফাইলের সম্ভাব্য পাথ চেক করা (Render Secret File অথবা প্রজেক্ট রুট)
+# কুকি ফাইল পাথ চেক
 COOKIE_FILE = None
 for path in ["cookies.txt", os.path.join(BASE_DIR, "cookies.txt"), "/etc/secrets/cookies.txt"]:
     if os.path.exists(path):
         COOKIE_FILE = path
         break
 
-print(f"[Auth] Cookie file detected: {COOKIE_FILE}")
-
 def get_ydl_options():
+    """Smart TV ক্লায়েন্ট কনফিগারেশন যা ক্লাউড সার্ভারের বট ব্লক বাইপাস করে"""
     opts = {
         'quiet': True,
         'no_warnings': True,
-        'format': 'best[ext=mp4][acodec!=none]/best[acodec!=none]/best',
+        'format': 'best',
         'extractor_args': {
             'youtube': {
-                'player_client': ['ios', 'android', 'web']
+                'player_client': ['tv_embedded', 'tv']
             }
         }
     }
@@ -139,7 +138,7 @@ threading.Thread(target=start_continuous_stream, daemon=True).start()
 def serve_hls(filename: str):
     file_path = os.path.join(HLS_DIR, filename)
     if not os.path.exists(file_path):
-        raise HTTPException(status_code=503, detail="Stream is preparing, please wait...")
+        raise HTTPException(status_code=503, detail="Stream is preparing, please wait a moment...")
     return FileResponse(file_path)
 
 @app.get("/")
