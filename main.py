@@ -17,47 +17,50 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# টার্গেট চ্যানেলের ভিডিও ট্যাব URL
 CHANNEL_URL = "https://www.youtube.com/@only_kdrama_bangla_explanation/videos"
 
-# ডিরেক্টরি সেটআপ (Render পারমিশন এরর এড়াতে প্রজেক্টের ভেতরে পাথ)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 HLS_DIR = os.path.join(BASE_DIR, "hls")
 os.makedirs(HLS_DIR, exist_ok=True)
 
-def get_channel_video_ids():
-    """চ্যানেল থেকে সব আপলোড করা ভিডিওর আইডি সংগ্রহ করে"""
-    ydl_opts = {
-        'extract_flat': True,
-        'quiet': True,
-        'cookiefile': 'cookies.txt'
+# অ্যান্ড্রয়েড ক্লায়েন্ট কনফিগারেশন (403 ব্লক ও n-challenge এড়াতে)
+YDL_BASE_OPTS = {
+    'quiet': True,
+    'no_warnings': True,
+    'extractor_args': {
+        'youtube': {
+            'player_client': ['android', 'ios']
+        }
     }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+}
+
+def get_channel_video_ids():
+    """চ্যানেল থেকে সব ভিডিওর আইডি সংগ্রহ করা"""
+    opts = YDL_BASE_OPTS.copy()
+    opts['extract_flat'] = True
+    with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(CHANNEL_URL, download=False)
         entries = info.get('entries', [])
-        video_ids = [entry['id'] for entry in entries if entry and 'id' in entry]
-        return video_ids
+        return [entry['id'] for entry in entries if entry and 'id' in entry]
 
 def get_single_stream_url(video_id):
-    """একটি ভিডিওর জন্য ফ্রেশ স্ট্রিম লিংক বের করে"""
-    ydl_opts = {
-        'format': 'best[ext=mp4]/best',
-        'quiet': True,
-        'cookiefile': 'cookies.txt'
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+    """অ্যান্ড্রয়েড ক্লায়েন্ট ব্যবহার করে ফ্রেশ স্ট্রিম লিঙ্ক বের করা"""
+    opts = YDL_BASE_OPTS.copy()
+    opts['format'] = 'best[ext=mp4]/best'
+    
+    with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
         return info.get('url')
 
 def start_continuous_stream():
-    """লুপ করে একটির পর একটি ভিডিও লাইভ m3u8 এ কনভার্ট করতে থাকবে"""
+    """ধারাবাহিক লাইভ m3u8 ব্রডকাস্ট লুপ"""
     while True:
         try:
             print("Fetching video list from channel...")
             video_ids = get_channel_video_ids()
             
             if not video_ids:
-                print("No videos found or rate limited. Retrying in 15 seconds...")
+                print("No videos found. Retrying in 15 seconds...")
                 time.sleep(15)
                 continue
 
@@ -69,7 +72,7 @@ def start_continuous_stream():
                     if not stream_url:
                         continue
 
-                    # FFmpeg রেম্যাক্সিং (CPU ব্যবহার ১-২% এর নিচে থাকবে)
+                    # FFmpeg রেম্যাক্স করে HLS স্ট্রিম তৈরি
                     cmd = [
                         'ffmpeg',
                         '-re',
@@ -91,13 +94,11 @@ def start_continuous_stream():
                     time.sleep(2)
 
         except Exception as e:
-            print(f"Error in continuous stream loop: {e}")
+            print(f"Loop error: {e}")
             time.sleep(10)
 
-# ব্যাকগ্রাউন্ডে স্ট্রিম চালু রাখা
 threading.Thread(target=start_continuous_stream, daemon=True).start()
 
-# m3u8 এবং .ts ফাইল সার্ভ করার এন্ডপয়েন্ট
 app.mount("/hls", StaticFiles(directory=HLS_DIR), name="hls")
 
 @app.get("/")
