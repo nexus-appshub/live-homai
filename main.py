@@ -27,25 +27,32 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 HLS_DIR = os.path.join(BASE_DIR, "hls")
 os.makedirs(HLS_DIR, exist_ok=True)
 
-# সার্বিক স্ট্যাটাস ট্র্যাক করার ভেরিয়েবল
 STREAM_STATUS = {"state": "Initializing", "current_video": None, "last_error": None}
-
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 
-YDL_OPTS = {
-    'quiet': True,
-    'no_warnings': True,
-    # অডিও ও ভিডিও উভয়ই আছে এমন সেরা ফরম্যাট নির্বাচন
-    'format': 'best[ext=mp4][acodec!=none]/best[acodec!=none]/best',
-    'extractor_args': {
-        'youtube': {
-            'player_client': ['android', 'ios']
+# কুকি ফাইলের সম্ভাব্য পাথ চেক করা (Render Secret File অথবা প্রজেক্ট রুট)
+COOKIE_FILE = None
+for path in ["cookies.txt", os.path.join(BASE_DIR, "cookies.txt"), "/etc/secrets/cookies.txt"]:
+    if os.path.exists(path):
+        COOKIE_FILE = path
+        break
+
+print(f"[Auth] Cookie file detected: {COOKIE_FILE}")
+
+def get_ydl_options():
+    opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'format': 'best[ext=mp4][acodec!=none]/best[acodec!=none]/best',
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['ios', 'android', 'web']
+            }
         }
     }
-}
-
-if os.path.exists(os.path.join(BASE_DIR, "cookies.txt")):
-    YDL_OPTS['cookiefile'] = os.path.join(BASE_DIR, "cookies.txt")
+    if COOKIE_FILE:
+        opts['cookiefile'] = COOKIE_FILE
+    return opts
 
 def keep_alive_ping():
     app_url = os.environ.get("RENDER_EXTERNAL_URL", "https://live-homai.onrender.com")
@@ -59,14 +66,15 @@ def keep_alive_ping():
         time.sleep(600)
 
 def get_channel_video_ids():
-    opts = YDL_OPTS.copy()
+    opts = get_ydl_options()
     opts['extract_flat'] = True
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(CHANNEL_URL, download=False)
         return [entry['id'] for entry in info.get('entries', []) if entry and 'id' in entry]
 
 def get_single_stream_url(video_id):
-    with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
+    opts = get_ydl_options()
+    with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
         return info.get('url')
 
@@ -79,6 +87,7 @@ def start_continuous_stream():
             STREAM_STATUS["state"] = "Fetching videos"
             video_ids = get_channel_video_ids()
             if not video_ids:
+                STREAM_STATUS["last_error"] = "No videos returned. Retrying in 15 seconds..."
                 time.sleep(15)
                 continue
 
@@ -92,8 +101,8 @@ def start_continuous_stream():
                         continue
 
                     STREAM_STATUS["state"] = f"Streaming {vid}"
+                    STREAM_STATUS["last_error"] = None
 
-                    # FFmpeg-এ সরাসরি User-Agent পাস করা হয়েছে যাতে YouTube 403 ব্লক না করে
                     cmd = [
                         'ffmpeg',
                         '-user_agent', USER_AGENT,
@@ -113,9 +122,7 @@ def start_continuous_stream():
                     _, stderr = process.communicate()
                     
                     if process.returncode != 0:
-                        err_msg = stderr.decode('utf-8', errors='ignore')[-300:]
-                        STREAM_STATUS["last_error"] = err_msg
-                        print(f"FFmpeg Error: {err_msg}")
+                        STREAM_STATUS["last_error"] = stderr.decode('utf-8', errors='ignore')[-300:]
 
                 except Exception as err:
                     STREAM_STATUS["last_error"] = str(err)
@@ -132,16 +139,14 @@ threading.Thread(target=start_continuous_stream, daemon=True).start()
 def serve_hls(filename: str):
     file_path = os.path.join(HLS_DIR, filename)
     if not os.path.exists(file_path):
-        raise HTTPException(
-            status_code=503, 
-            detail="Stream is preparing, please wait 10-15 seconds and refresh..."
-        )
+        raise HTTPException(status_code=503, detail="Stream is preparing, please wait...")
     return FileResponse(file_path)
 
 @app.get("/")
 def index():
     return {
         "server": "online",
+        "cookie_loaded": COOKIE_FILE is not None,
         "stream_info": STREAM_STATUS,
         "stream_url": "/hls/live.m3u8"
     }
