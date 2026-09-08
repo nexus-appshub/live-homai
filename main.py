@@ -17,12 +17,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# আপনার টার্গেট প্লেলিস্ট বা চ্যানেল লিংক
 PLAYLIST_URL = "https://www.youtube.com/playlist?list=YOUR_PLAYLIST_ID"
-HLS_DIR = "/app/hls"
+
+# রুট /app এর বদলে বর্তমান প্রজেক্ট ডিরেক্টরির ভেতরে ফোল্ডার পাথ
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+HLS_DIR = os.path.join(BASE_DIR, "hls")
+
+# সার্ভার স্টার্ট হওয়ার আগেই ফোল্ডারটি নিশ্চিতভাবে তৈরি করা হচ্ছে
+os.makedirs(HLS_DIR, exist_ok=True)
 
 def get_playlist_stream_urls():
-    """প্লেলিস্ট থেকে সব ভিডিওর ডিরেক্ট স্ট্রিমিং লিংক বের করে আনে"""
     ydl_opts = {
         'format': 'best[ext=mp4]/best',
         'quiet': True,
@@ -38,9 +42,6 @@ def get_playlist_stream_urls():
         return urls
 
 def start_continuous_stream():
-    """ব্যাকগ্রাউন্ডে একটার পর একটা ভিডিও HLS ফরম্যাটে রেন্ডার করতে থাকবে"""
-    os.makedirs(HLS_DIR, exist_ok=True)
-    
     while True:
         try:
             stream_urls = get_playlist_stream_urls()
@@ -49,7 +50,6 @@ def start_continuous_stream():
                 continue
 
             for url in stream_urls:
-                # FFmpeg দিয়ে রেন্ডার না করে রেম্যাক্স (copy) করা হচ্ছে, CPU ব্যবহার ১-৫% এর নিচে থাকবে
                 cmd = [
                     'ffmpeg',
                     '-re',
@@ -61,7 +61,7 @@ def start_continuous_stream():
                     '-hls_time', '4',
                     '-hls_list_size', '5',
                     '-hls_flags', 'delete_segments+append_list',
-                    f'{HLS_DIR}/live.m3u8'
+                    os.path.join(HLS_DIR, 'live.m3u8')
                 ]
                 process = subprocess.Popen(cmd)
                 process.wait()
@@ -70,10 +70,10 @@ def start_continuous_stream():
             print(f"Error in stream: {e}")
             time.sleep(5)
 
-# ব্যাকগ্রাউন্ডে স্ট্রিম চালু করা
+# ব্যাকগ্রাউন্ড থ্রেড
 threading.Thread(target=start_continuous_stream, daemon=True).start()
 
-# m3u8 এবং .ts ফাইলগুলো সার্ভ করার পাথ
+# m3u8 মাউন্ট
 app.mount("/hls", StaticFiles(directory=HLS_DIR), name="hls")
 
 if __name__ == "__main__":
