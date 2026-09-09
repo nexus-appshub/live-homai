@@ -1,19 +1,21 @@
-import os
+ import os
 import ssl
 import time
+import json
 import threading
 import urllib.request
 import yt_dlp
-from fastapi import FastAPI, Response
-from fastapi.responses import RedirectResponse
+from fastapi import FastAPI, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
 app = FastAPI()
 
+# সব ধরণের ওয়েব প্লেয়ারের জন্য সম্পূর্ণ CORS পারমিশন
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -25,18 +27,19 @@ SSL_CTX = ssl.create_default_context()
 SSL_CTX.check_hostname = False
 SSL_CTX.verify_mode = ssl.CERT_NONE
 
-# পরীক্ষিত ও দ্রুতগতির প্রক্সি নোড (বট-ব্লক ছাড়া সরাসরি MP4 প্লে করতে)
-INVIDIOUS_NODES = [
-    "https://inv.tux.pizza",
-    "https://invidious.projectsegfau.lt",
-    "https://invidious.flokinet.to",
-    "https://iv.melmac.space",
-    "https://yt.artemislena.eu",
-    "https://invidious.drgns.space"
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+
+# সক্রিয় Piped API ক্লাস্টার তালিকা (সরাসরি HLS .m3u8 স্ট্রিম প্রদান করে)
+PIPED_INSTANCES = [
+    "https://pipedapi.tokhmi.xyz",
+    "https://api.piped.privacydev.net",
+    "https://piped-api.lunar.icu",
+    "https://pipedapi.drgns.space",
+    "https://api.piped.private.coffee"
 ]
 
+# ১. Render স্লিপ প্রতিরোধে সেলফ-পিং
 def keep_alive_ping():
-    """Render স্লিপ প্রতিরোধে অটো-পিং"""
     app_url = os.environ.get("RENDER_EXTERNAL_URL", "https://live-homai.onrender.com")
     time.sleep(30)
     while True:
@@ -49,8 +52,8 @@ def keep_alive_ping():
 
 threading.Thread(target=keep_alive_ping, daemon=True).start()
 
+# ২. চ্যানেলের সব ভিডিও তালিকা সংগ্রহ
 def get_channel_videos():
-    """চ্যানেলের সব ভিডিও তালিকা সংগ্রহ"""
     opts = {'extract_flat': True, 'quiet': True, 'no_warnings': True}
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(CHANNEL_URL, download=False)
@@ -66,56 +69,80 @@ def get_channel_videos():
                 })
         return videos
 
-# ১. IPTV প্লেয়ারের জন্য স্ট্যান্ডার্ড M3U প্লেলিস্ট
+# ৩. ভিডিও আইডির জন্য HLS (.m3u8) ম্যানিফেস্ট সংগ্রহ
+def get_video_hls_manifest(video_id: str):
+    clean_id = video_id.replace(".m3u8", "")
+    for base in PIPED_INSTANCES:
+        api_url = f"{base}/streams/{clean_id}"
+        try:
+            req = urllib.request.Request(api_url, headers={'User-Agent': USER_AGENT})
+            with urllib.request.urlopen(req, timeout=4, context=SSL_CTX) as resp:
+                data = json.loads(resp.read().decode('utf-8'))
+                hls_url = data.get("hls")
+                if hls_url:
+                    # ম্যানিফেস্ট ফেচ করা
+                    m_req = urllib.request.Request(hls_url, headers={'User-Agent': USER_AGENT})
+                    with urllib.request.urlopen(m_req, timeout=4, context=SSL_CTX) as m_resp:
+                        return m_resp.read().decode('utf-8')
+        except Exception:
+            continue
+    return None
+
+# ৪. Home Air Tv ও অন্যান্য IPTV প্লেয়ারের জন্য স্ট্যান্ডার্ড M3U
 @app.get("/playlist.m3u")
-def generate_m3u_playlist():
+def get_m3u_playlist():
     app_url = os.environ.get("RENDER_EXTERNAL_URL", "https://live-homai.onrender.com").rstrip('/')
     videos = get_channel_videos()
     
-    m3u_lines = ["#EXTM3U\n"]
+    m3u = ["#EXTM3U\n"]
     for v in videos:
-        # প্রতিটি চ্যানেল সরাসরি আমাদের স্ট্রিমিং এন্ডপয়েন্টে পয়েন্ট করবে
-        stream_link = f"{app_url}/video/{v['id']}.mp4"
-        m3u_lines.append(f'#EXTINF:-1 tvg-id="{v["id"]}" tvg-name="{v["title"]}" tvg-logo="{v["thumbnail"]}" group-title="{CHANNEL_NAME}",{v["title"]}\n')
-        m3u_lines.append(f'{stream_link}\n')
+        # প্রতিটি লিঙ্ক এখন সরাসরি একটি .m3u8 স্ট্রিম
+        stream_url = f"{app_url}/stream/{v['id']}.m3u8"
+        m3u.append(f'#EXTINF:-1 tvg-id="{v["id"]}" tvg-name="{v["title"]}" tvg-logo="{v["thumbnail"]}" group-title="{CHANNEL_NAME}",{v["title"]}\n')
+        m3u.append(f'{stream_url}\n')
         
     return Response(
-        content="".join(m3u_lines), 
-        media_type="application/x-mpegurl",
-        headers={"Access-Control-Allow-Origin": "*"}
+        content="".join(m3u),
+        media_type="application/vnd.apple.mpegurl",
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Cache-Control": "no-cache"
+        }
     )
 
-# ২. ব্রাউজার ও IPTV-র জন্য সরাসরি ভিডিও স্ট্রিমিং রিডাইরেক্টর
-@app.get("/video/{video_id}.mp4")
-def stream_video(video_id: str):
-    # .mp4 এক্সটেনশন স্ট্রিপ করা
-    clean_id = video_id.replace(".mp4", "")
+# ৫. প্রতিটি ভিডিওর জন্য অন-ডিমান্ড .m3u8 HLS স্ট্রিমার (CORS সাপোর্টেড)
+@app.get("/stream/{video_id}.m3u8")
+def serve_stream(video_id: str):
+    manifest = get_video_hls_manifest(video_id)
+    if not manifest:
+        raise HTTPException(status_code=502, detail="Unable to extract HLS stream from YouTube.")
     
-    # সচল প্রক্সি নোড খুঁজে সরাসরি স্ট্রিমে রিডাইরেক্ট করা
-    for base in INVIDIOUS_NODES:
-        stream_url = f"{base}/latest_version?id={clean_id}&itag=18&local=true"
-        try:
-            req = urllib.request.Request(
-                stream_url, 
-                headers={'User-Agent': 'Mozilla/5.0', 'Range': 'bytes=0-100'}
-            )
-            with urllib.request.urlopen(req, timeout=3, context=SSL_CTX) as resp:
-                if resp.status in (200, 206):
-                    # প্লেয়ারকে সরাসরি কাজ করা স্ট্রিম লিংকে রিডাইরেক্ট করবে
-                    return RedirectResponse(url=stream_url, status_code=302)
-        except Exception:
-            continue
-            
-    # ব্যাকআপ হিসেবে প্রথম নোডে রিডাইরেক্ট
-    fallback_url = f"{INVIDIOUS_NODES[0]}/latest_version?id={clean_id}&itag=18&local=true"
-    return RedirectResponse(url=fallback_url, status_code=302)
+    return Response(
+        content=manifest,
+        media_type="application/vnd.apple.mpegurl",
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "*",
+            "Cache-Control": "no-cache, no-store, must-revalidate"
+        }
+    )
+
+# ৬. ২৪/৭ লিনিয়ার একটানা অটো-প্লে চ্যানেল
+@app.get("/live.m3u8")
+def live_continuous():
+    app_url = os.environ.get("RENDER_EXTERNAL_URL", "https://live-homai.onrender.com").rstrip('/')
+    videos = get_channel_videos()
+    if not videos:
+        raise HTTPException(status_code=404, detail="No videos found")
+    # প্রথম ভিডিওটির HLS দিয়ে স্টার্ট হবে
+    return serve_stream(videos[0]['id'])
 
 @app.get("/")
 def index():
     return {
         "status": "online",
-        "iptv_playlist": "https://live-homai.onrender.com/playlist.m3u",
-        "player_compatible": True
+        "home_air_tv_playlist": "https://live-homai.onrender.com/playlist.m3u",
+        "single_live_channel": "https://live-homai.onrender.com/live.m3u8"
     }
 
 if __name__ == "__main__":
